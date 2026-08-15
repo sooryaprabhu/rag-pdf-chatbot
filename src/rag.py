@@ -9,6 +9,13 @@ from langchain.schema import Document
 from pinecone import Pinecone, ServerlessSpec
 
 
+def get_pinecone_client():
+    api_key = os.environ.get('PINECONE_API_KEY')
+    if not api_key:
+        raise ValueError("PINECONE_API_KEY not found!")
+    return Pinecone(api_key=api_key)
+
+
 def load_pdf(filepath, filename="document"):
     reader = PdfReader(filepath)
     documents = []
@@ -39,9 +46,11 @@ def split_documents(documents):
 
 
 def create_vector_store(chunks, index_name="rag-pdf-chatbot"):
-    pc = Pinecone(api_key=os.environ.get('PINECONE_API_KEY'))
+    pc = get_pinecone_client()
 
-    if index_name not in pc.list_indexes().names():
+    existing = [i.name for i in pc.list_indexes()]
+
+    if index_name not in existing:
         pc.create_index(
             name=index_name,
             dimension=1536,
@@ -50,15 +59,17 @@ def create_vector_store(chunks, index_name="rag-pdf-chatbot"):
         )
         print(f"Created Pinecone index: {index_name}")
     else:
-        print(f"Using existing Pinecone index: {index_name}")
+        print(f"Using existing index: {index_name}")
 
     embeddings = OpenAIEmbeddings(
         api_key=os.environ.get('OPENAI_API_KEY')
     )
+
     vector_store = PineconeVectorStore.from_documents(
         chunks,
         embeddings,
-        index_name=index_name
+        index_name=index_name,
+        pinecone_api_key=os.environ.get('PINECONE_API_KEY')
     )
     print(f"Stored {len(chunks)} chunks in Pinecone!")
     return vector_store
@@ -80,17 +91,16 @@ def create_qa_chain(vector_store, uploaded_files=None):
         api_key=os.environ.get('OPENAI_API_KEY')
     )
 
-    # Tell the LLM which documents are loaded
     files_context = ""
     if uploaded_files:
         files_context = f"The uploaded documents are: {', '.join(uploaded_files)}. "
 
     prompt_template = f"""You are a helpful financial analyst assistant.
 {files_context}
-Each piece of context below comes from a specific document — 
+Each piece of context below comes from a specific document.
 ALWAYS mention the document name and company when answering.
-If comparing multiple companies, clearly label each company's information.
-Never say "the company" — always use the actual company or document name.
+If comparing multiple companies clearly label each company.
+Never say "the company" — always use the actual company name.
 
 Context: {{context}}
 Question: {{question}}
