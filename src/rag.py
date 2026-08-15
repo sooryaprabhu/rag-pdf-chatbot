@@ -7,32 +7,37 @@ from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from pinecone import Pinecone, ServerlessSpec
+import time
 
 
-def get_pinecone_client():
+def get_pinecone_index(index_name="rag-pdf-chatbot"):
     api_key = os.environ.get('PINECONE_API_KEY')
-    if not api_key:
-        raise ValueError("PINECONE_API_KEY not found!")
-    return Pinecone(api_key=api_key)
+    pc = Pinecone(api_key=api_key)
+    existing = [i.name for i in pc.list_indexes()]
+    if index_name not in existing:
+        pc.create_index(
+            name=index_name,
+            dimension=1536,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+        time.sleep(5)
+        print(f"Created index: {index_name}")
+    return pc.Index(index_name)
 
 
 def load_pdf(filepath, filename="document"):
     reader = PdfReader(filepath)
     documents = []
-    full_text = ""
     for i, page in enumerate(reader.pages):
         page_text = page.extract_text()
         if page_text:
-            full_text += page_text
             documents.append(Document(
                 page_content=page_text,
-                metadata={
-                    "source": filename,
-                    "page": i + 1
-                }
+                metadata={"source": filename, "page": i + 1}
             ))
-    print(f"PDF loaded: {filename} — {len(documents)} pages")
-    return full_text, documents
+    print(f"Loaded: {filename} — {len(documents)} pages")
+    return "", documents
 
 
 def split_documents(documents):
@@ -46,40 +51,33 @@ def split_documents(documents):
 
 
 def create_vector_store(chunks, index_name="rag-pdf-chatbot"):
-    pc = get_pinecone_client()
+    api_key = os.environ.get('PINECONE_API_KEY')
+    openai_key = os.environ.get('OPENAI_API_KEY')
 
-    existing = [i.name for i in pc.list_indexes()]
+    embeddings = OpenAIEmbeddings(api_key=openai_key)
 
-    if index_name not in existing:
-        pc.create_index(
-            name=index_name,
-            dimension=1536,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
-        print(f"Created Pinecone index: {index_name}")
-    else:
-        print(f"Using existing index: {index_name}")
+    # Get or create index
+    get_pinecone_index(index_name)
 
-    embeddings = OpenAIEmbeddings(
-        api_key=os.environ.get('OPENAI_API_KEY')
-    )
-
-    vector_store = PineconeVectorStore.from_documents(
-        chunks,
-        embeddings,
+    vector_store = PineconeVectorStore(
         index_name=index_name,
-        pinecone_api_key=os.environ.get('PINECONE_API_KEY')
+        embedding=embeddings,
+        pinecone_api_key=api_key
     )
-    print(f"Stored {len(chunks)} chunks in Pinecone!")
+
+    # Add documents
+    texts = [c.page_content for c in chunks]
+    metadatas = [c.metadata for c in chunks]
+    vector_store.add_texts(texts, metadatas=metadatas)
+
+    print(f"Stored {len(chunks)} chunks!")
     return vector_store
 
 
 def add_pdf_to_store(vector_store, chunks):
-    embeddings = OpenAIEmbeddings(
-        api_key=os.environ.get('OPENAI_API_KEY')
-    )
-    vector_store.add_documents(chunks)
+    texts = [c.page_content for c in chunks]
+    metadatas = [c.metadata for c in chunks]
+    vector_store.add_texts(texts, metadatas=metadatas)
     print(f"Added {len(chunks)} more chunks!")
     return vector_store
 
@@ -97,9 +95,7 @@ def create_qa_chain(vector_store, uploaded_files=None):
 
     prompt_template = f"""You are a helpful financial analyst assistant.
 {files_context}
-Each piece of context below comes from a specific document.
 ALWAYS mention the document name and company when answering.
-If comparing multiple companies clearly label each company.
 Never say "the company" — always use the actual company name.
 
 Context: {{context}}
@@ -112,9 +108,7 @@ Answer:"""
         input_variables=["context", "question"]
     )
 
-    retriever = vector_store.as_retriever(
-        search_kwargs={"k": 5}
-    )
+    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
