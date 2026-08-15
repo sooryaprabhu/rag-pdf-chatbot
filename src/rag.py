@@ -2,98 +2,121 @@ import os
 from pypdf import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
+from langchain_pinecone import PineconeVectorStore
 from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from pinecone import Pinecone, ServerlessSpec
 
 
-def load_pdf(filepath):
-    # Read the PDF file and extract all text
-    # pypdf opens the PDF page by page
+def load_pdf(filepath, filename="document"):
     reader = PdfReader(filepath)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text()
-    print(f"PDF loaded: {len(text)} characters extracted")
-    return text
+    documents = []
+    full_text = ""
+    for i, page in enumerate(reader.pages):
+        page_text = page.extract_text()
+        if page_text:
+            full_text += page_text
+            documents.append(Document(
+                page_content=page_text,
+                metadata={
+                    "source": filename,
+                    "page": i + 1
+                }
+            ))
+    print(f"PDF loaded: {filename} — {len(documents)} pages")
+    return full_text, documents
 
 
-def split_text(text):
-    # Split text into small chunks
-    # We can't send the whole document to OpenAI at once
-    # chunk_size = max characters per chunk
-    # chunk_overlap = how many characters overlap between chunks
-    # overlap helps preserve context at chunk boundaries
+def split_documents(documents):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=50
     )
-    chunks = splitter.split_text(text)
-    print(f"Text split into {len(chunks)} chunks")
+    chunks = splitter.split_documents(documents)
+    print(f"Split into {len(chunks)} chunks")
     return chunks
 
 
-def create_vector_store(chunks):
-    # Convert chunks to embeddings and store in FAISS
-    # OpenAIEmbeddings converts text to vectors
-    # FAISS stores and indexes those vectors
+def create_vector_store(chunks, index_name="rag-pdf-chatbot"):
+    pc = Pinecone(api_key=os.environ.get('PINECONE_API_KEY'))
+
+    if index_name not in pc.list_indexes().names():
+        pc.create_index(
+            name=index_name,
+            dimension=1536,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+        print(f"Created Pinecone index: {index_name}")
+    else:
+        print(f"Using existing Pinecone index: {index_name}")
+
     embeddings = OpenAIEmbeddings(
         api_key=os.environ.get('OPENAI_API_KEY')
     )
-    vector_store = FAISS.from_texts(chunks, embeddings)
-    print("Vector store created successfully")
+    vector_store = PineconeVectorStore.from_documents(
+        chunks,
+        embeddings,
+        index_name=index_name
+    )
+    print(f"Stored {len(chunks)} chunks in Pinecone!")
     return vector_store
 
 
-def create_qa_chain(vector_store):
-    # Create the question answering chain
-    # This connects:
-    # retriever (finds relevant chunks)
-    # + LLM (answers based on those chunks)
+def add_pdf_to_store(vector_store, chunks):
+    embeddings = OpenAIEmbeddings(
+        api_key=os.environ.get('OPENAI_API_KEY')
+    )
+    vector_store.add_documents(chunks)
+    print(f"Added {len(chunks)} more chunks!")
+    return vector_store
+
+
+def create_qa_chain(vector_store, uploaded_files=None):
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
         api_key=os.environ.get('OPENAI_API_KEY')
     )
-    # retriever searches the vector store
-    # k=3 means find top 3 most relevant chunks
-    retriever = vector_store.as_retriever(
-        search_kwargs={"k": 3}
+
+    # Tell the LLM which documents are loaded
+    files_context = ""
+    if uploaded_files:
+        files_context = f"The uploaded documents are: {', '.join(uploaded_files)}. "
+
+    prompt_template = f"""You are a helpful financial analyst assistant.
+{files_context}
+Each piece of context below comes from a specific document — 
+ALWAYS mention the document name and company when answering.
+If comparing multiple companies, clearly label each company's information.
+Never say "the company" — always use the actual company or document name.
+
+Context: {{context}}
+Question: {{question}}
+
+Answer:"""
+
+    prompt = PromptTemplate(
+        template=prompt_template,
+        input_variables=["context", "question"]
     )
-    # RetrievalQA combines retriever + LLM
+
+    retriever = vector_store.as_retriever(
+        search_kwargs={"k": 5}
+    )
+
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
-        retriever=retriever
+        retriever=retriever,
+        return_source_documents=True,
+        chain_type_kwargs={"prompt": prompt}
     )
-    print("QA chain ready!")
     return qa_chain
 
 
-def ask_question(qa_chain, question):
-    # Ask a question and get an answer
-    print(f"\nQuestion: {question}")
+def ask_with_sources(qa_chain, question):
     result = qa_chain.invoke({"query": question})
     answer = result["result"]
-    print(f"Answer: {answer}")
-    return answer
-
-
-if __name__ == "__main__":
-    # Test the full RAG pipeline
-    pdf_path = "data/📍Soorya_Prabhu_CV.pdf"
-
-    # Step 1 — Load PDF
-    text = load_pdf(pdf_path)
-
-    # Step 2 — Split into chunks
-    chunks = split_text(text)
-
-    # Step 3 — Create vector store
-    vector_store = create_vector_store(chunks)
-
-    # Step 4 — Create QA chain
-    qa_chain = create_qa_chain(vector_store)
-
-    # Step 5 — Ask questions about YOUR CV
-    ask_question(qa_chain, "What is Soorya's educational background?")
-    ask_question(qa_chain, "What programming languages does Soorya know?")
-    ask_question(qa_chain, "What projects has Soorya worked on?")
+    sources = result.get("source_documents", [])
+    return answer, sources
